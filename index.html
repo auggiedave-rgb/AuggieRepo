@@ -287,6 +287,26 @@ const VOCore = (() => {
     return median(ang, 0.8);
   }
 
+  // Rotazione che allinea al meglio i raggi delle due viste (Kabsch): è il modello giusto
+  // quando il moto è rotazione pura, caso in cui la matrice essenziale è mal determinata.
+  function fitRotation(R0, x1, x2, mask, n) {
+    let R = R0;
+    for (let pass = 0; pass < 2; pass++) {
+      const Hm = new Array(9).fill(0); let cnt = 0;
+      for (let i = 0; i < n; i++) if (mask[i]) {
+        const a = [x1[2*i], x1[2*i+1], 1], b = [x2[2*i], x2[2*i+1], 1], na = norm(a), nb = norm(b);
+        const p = mv(R, a), cs = dot(p, b) / (norm(p) * nb);
+        if (cs < 0.99985) continue;                                        // oltre 1°: non segue la rotazione
+        for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) Hm[r*3+c] += (a[r] / na) * (b[c] / nb);
+        cnt++;
+      }
+      if (cnt < 8) return R;
+      const { U, V } = svd3(Hm);
+      R = mul3(V, T3(U));
+    }
+    return R;
+  }
+
   function quat(R) {
     const tr = R[0] + R[4] + R[8];
     let w, x, y, z;
@@ -344,8 +364,9 @@ const VOCore = (() => {
 
       // Caso 1: rotazione (quasi) pura → aggiorno solo l'orientamento
       const ra = rotResidualDeg(Ra, x1, x2, mask, n), rb = rotResidualDeg(Rb, x1, x2, mask, n);
-      if (Math.min(ra, rb) < ROT_ONLY_DEG) {
-        const R = ra <= rb ? Ra : Rb;
+      const Rk = fitRotation(ra <= rb ? Ra : Rb, x1, x2, mask, n), rk = rotResidualDeg(Rk, x1, x2, mask, n);
+      if (Math.min(ra, rb, rk) < ROT_ONLY_DEG) {
+        const R = rk <= Math.min(ra, rb) ? Rk : ra <= rb ? Ra : Rb;
         for (let i = 0; i < n; i++) if (mask[i] && isFinite(depth[i])) {
           const d = depth[i] * (R[6]*x1[2*i] + R[7]*x1[2*i+1] + R[8]);
           if (d > 0) newDepth[i] = d;
@@ -559,7 +580,7 @@ class VOTracker {
     this.cv = cv; this.w = w; this.h = h; this.intr = intr;
     this.f = intr.fx;
     this.odo = new VOCore.Odometer(this.f, intr.cx, intr.cy);
-    this.MAX = 300; this.MIN_KEEP = 200;
+    this.MAX = 300; this.MIN_KEEP = 200; this.HOLD_MIN = 90; this.SOLID = 30;
     this.parPx = 0.03 * Math.max(w, h);            // parallasse (px) che fa scattare un keyframe
     const M = this.MAX;
     this.cur = new Float32Array(2 * M);            // posizione nell'immagine (per il flusso ottico)
@@ -589,6 +610,7 @@ class VOTracker {
   reset() {
     this.odo.reset(); this.n = 0; this.n3d = 0; this.hasPrev = false;
     this.poses = []; this.kfPose = 0; this.refDepth = 0;
+    this.frame = 0; this.lastEval = 0; this.holding = false; this.nextPar = this.parPx; this.quality = 0;
     this.last = { mode: 'init', inliers: 0, parallax: 0 };
   }
 
@@ -603,15 +625,26 @@ class VOTracker {
       if (pnp) { info.mode = 'pnp'; info.inliers = pnp; }
       const par = this._parallax(); info.parallax = par;
       const low = this.n < 25;
-      if (par >= this.parPx || (low && par >= 4)) {
+      this.frame++; this.quality = pnp;
+      const due = par >= this.nextPar || (this.holding && this.frame - this.lastEval >= 5);
+      if ((par >= this.parPx && due) || (low && par >= 4)) {
+        let hold = false;
+        this.lastEval = this.frame;
         if (pnp) {
           this._triangulate(); this.odo.keyframes++;
         } else {
           const r = this._twoView(tMs);
           info.mode = r ? r.mode : 'fail'; info.inliers = r ? r.inliers : 0;
+          this.quality = r && r.mode === 'move' ? r.inliers : 0;
+          // Solo rotazione: tengo lo stesso keyframe di partenza e aspetto che la traslazione
+          // accumuli abbastanza parallasse; ripartire da qui la azzererebbe a ogni passo.
+          hold = !!r && r.mode === 'rot' && this.n >= this.HOLD_MIN;
         }
-        this._markKeyframe();
-        if (this.n < this.MIN_KEEP) this._detect(gray);
+        if (hold) { this.holding = true; this.nextPar = par * 1.2; }
+        else {
+          this._markKeyframe();
+          if (this.n < this.MIN_KEEP) this._detect(gray);
+        }
       } else if (low) {
         this._markKeyframe(); this._detect(gray); info.mode = 'fail';
       }
@@ -666,7 +699,8 @@ class VOTracker {
 
   _markKeyframe() {
     this.kf.set(this.ucur.subarray(0, 2 * this.n));
-    this.poses.push({ R: this.odo.R.slice(), p: this.odo.p.slice() });
+    this.holding = false; this.nextPar = this.parPx;
+    this.poses.push({ R: this.odo.R.slice(), p: this.odo.p.slice(), q: this.quality });   // q: quanti punti sostengono questa posa
     this.kfPose = this.poses.length - 1;
   }
 
@@ -708,7 +742,7 @@ class VOTracker {
     const cv = this.cv, idx = [];
     for (let i = 0; i < this.n; i++) if (this.has[i]) idx.push(i);
     const m = idx.length;
-    if (m < 12) return 0;
+    if (m < 15) return 0;
     const obj = new cv.Mat(m, 1, cv.CV_32FC3), img = new cv.Mat(m, 1, cv.CV_32FC2), inl = new cv.Mat();
     const o = obj.data32F, q = img.data32F;
     for (let k = 0; k < m; k++) {
@@ -722,7 +756,7 @@ class VOTracker {
     this.tvec.data64F.set([-t0[0], -t0[1], -t0[2]]);
     let ok = false, count = 0;
     try { ok = cv.solvePnPRansac(obj, img, this.K, this.D, this.rvec, this.tvec, true, 100, 2.5, 0.99, inl, 0 /* SOLVEPNP_ITERATIVE */); } catch (e) { ok = false; }
-    if (ok && inl.rows >= Math.max(10, 0.4 * m)) {
+    if (ok && inl.rows >= Math.max(12, 0.5 * m)) {
       cv.Rodrigues(this.rvec, this.Rm);
       const R = VOCore.T3(Array.from(this.Rm.data64F)), t = this.tvec.data64F, c = VOCore.mv(R, [-t[0], -t[1], -t[2]]);
       if (c.every(isFinite)) {
@@ -746,14 +780,17 @@ class VOTracker {
   // è cresciuta abbastanza: più parallasse = profondità più precisa.
   _triangulate() {
     const f = this.f, cx = this.intr.cx, cy = this.intr.cy, Rc = this.odo.R, pc = this.odo.p, Rct = VOCore.T3(Rc), z = [0, 0], fresh = [];
+    const solid = this.quality >= this.SOLID;
     for (let i = 0; i < this.n; i++) {
       const P = this.poses[this.refIdx[i]];
+      // con pose poco sostenute l'errore di posa imita una piccola parallasse: ne pretendo di più
+      const minAng = solid && P.q >= this.SOLID ? 0.0175 : 0.045;          // 1° oppure 2,6°
       const R = VOCore.mul3(Rct, P.R), t = VOCore.mv(Rct, [P.p[0]-pc[0], P.p[1]-pc[1], P.p[2]-pc[2]]);
       const a = (this.ref[2*i] - cx) / f, b = (this.ref[2*i+1] - cy) / f, c = (this.ucur[2*i] - cx) / f, d = (this.ucur[2*i+1] - cy) / f;
       const q = VOCore.mv(R, [a, b, 1]);                                   // raggio della vista di riferimento
       const cs = (q[0]*c + q[1]*d + q[2]) / (Math.hypot(q[0], q[1], q[2]) * Math.hypot(c, d, 1));
       const ang = Math.acos(Math.min(1, cs));
-      if (ang < 0.0175 || (this.has[i] && ang < 1.3 * this.par[i])) continue;   // < 1° oppure nessun guadagno
+      if (ang < minAng || (this.has[i] && ang < 1.3 * this.par[i])) continue;   // poca parallasse oppure nessun guadagno
       VOCore.depths(R, t, a, b, c, d, z);
       if (!(z[0] > 0 && z[1] > 0)) continue;
       const A = [z[0]*q[0] + t[0], z[0]*q[1] + t[1], z[0]*q[2] + t[2]];    // punto visto dal primo raggio
@@ -763,7 +800,7 @@ class VOTracker {
       if (!this.has[i]) fresh.push(Xc[2]);
       this.has[i] = 1; this.strikes[i] = 0; this.par[i] = ang;
     }
-    this._noteDepth(fresh);
+    if (solid) this._noteDepth(fresh);
   }
 
   _noteDepth(z) {                     // profondità tipica dei punti appena entrati in mappa (media mobile)
